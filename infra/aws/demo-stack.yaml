@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Meda fictional-data demo - one EC2 server, encrypted persistent EBS, HTTPS via Caddy. Not a clinical/PHI deployment.
+Parameters:
+  DomainName:
+    Type: String
+    Description: A DNS name you control, e.g. meda-demo.example.com. Point its A record to the stack's PublicIp output.
+    AllowedPattern: '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$'
+  SourceBucket:
+    Type: String
+    Description: Private S3 bucket containing the source bundle produced by scripts/package-source.mjs.
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+  SourceKey:
+    Type: String
+    Default: meda/source.zip
+    AllowedPattern: '^[a-zA-Z0-9/_.-]+$'
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.small, t3.medium]
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+  Gateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Gateway
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  InternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Gateway
+  SubnetRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet
+      RouteTableId: !Ref RouteTable
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS and ACME validation only. Administration uses AWS Systems Manager; no public SSH.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP redirect and ACME validation
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS application
+  SetupSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Initial Meda workspace setup key. View securely in Secrets Manager; never paste in chat.
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+        IncludeSpace: false
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: ReadMedaSourceAndBootstrap
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${SourceBucket}/${SourceKey}'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref SetupSecret
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+  Server:
+    Type: AWS::EC2::Instance
+    DependsOn: [InternetRoute, SubnetRoute]
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref Subnet
+      SecurityGroupIds: [!Ref SecurityGroup]
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-meda'
+        - Key: DataClassification
+          Value: Fictional-demo-only
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          dnf install -y docker unzip
+          systemctl enable --now docker
+          mkdir -p /opt/meda/app /opt/meda/data
+          chmod 700 /opt/meda/data
+          chown 1000:1000 /opt/meda/data
+          aws s3 cp 's3://${SourceBucket}/${SourceKey}' /opt/meda/source.zip --region '${AWS::Region}' --only-show-errors
+          unzip -q /opt/meda/source.zip -d /opt/meda/app
+          cd /opt/meda/app
+          docker build -t meda-demo:current .
+          SETUP_KEY=$(aws secretsmanager get-secret-value --secret-id '${SetupSecret}' --region '${AWS::Region}' --query SecretString --output text)
+          umask 077
+          printf 'NODE_ENV=production\nAPP_ORIGIN=https://${DomainName}\nMEDA_SETUP_KEY=%s\nMEDA_DATA_DIR=/data\nHOST=0.0.0.0\nPORT=3001\n' "$SETUP_KEY" > /opt/meda/server.env
+          unset SETUP_KEY
+          docker network create meda
+          docker run -d --restart unless-stopped --name meda --network meda --env-file /opt/meda/server.env -v /opt/meda/data:/data meda-demo:current
+          printf '${DomainName} {\n  reverse_proxy meda:3001\n}\n' > /opt/meda/Caddyfile
+          docker volume create meda-caddy-data
+          docker volume create meda-caddy-config
+          docker run -d --restart unless-stopped --name meda-https --network meda -p 80:80 -p 443:443 -v /opt/meda/Caddyfile:/etc/caddy/Caddyfile:ro -v meda-caddy-data:/data -v meda-caddy-config:/config caddy:2.10.2-alpine
+  Address:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+  AddressAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt Address.AllocationId
+      InstanceId: !Ref Server
+Outputs:
+  WebsiteUrl:
+    Description: Available only after DNS points to PublicIp, instance initialization succeeds, and Caddy obtains TLS.
+    Value: !Sub 'https://${DomainName}'
+  PublicIp:
+    Value: !Ref Address
+  InstanceId:
+    Value: !Ref Server
+  SetupSecretArn:
+    Description: View the setup key securely in AWS Secrets Manager to create the first administrator.
+    Value: !Ref SetupSecret

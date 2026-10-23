@@ -1,0 +1,13 @@
+.git
+node_modules
+dist
+.meda-data
+.env
+.env.*
+artifacts
+attachments
+Meda*.zip
+Meda-review.html
+prototype
+reference
+docs

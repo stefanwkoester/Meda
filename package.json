@@ -1,0 +1,39 @@
+{
+  "name": "meda-dermatology-workspace",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "node --test tests/domain.test.mjs tests/api.test.mjs",
+    "package:review": "npm run build",
+    "start": "node server/index.mjs",
+    "test:e2e": "node tests/review.mjs",
+    "package:source": "node scripts/package-source.mjs"
+  },
+  "dependencies": {
+    "express": "5.3.0",
+    "lucide-react": "1.61.0",
+    "multer": "2.5.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@sparticuz/chromium": "153.0.0",
+    "@types/express": "5.0.6",
+    "@types/multer": "2.3.0",
+    "@types/node": "26.6.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "prettier": "3.9.10",
+    "@vitejs/plugin-react": "6.1.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.5"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}
